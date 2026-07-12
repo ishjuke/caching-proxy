@@ -51,3 +51,43 @@ A Lua script appends a random query string per request so no two requests share 
 | Cache MISS |       ~1,590 |     16.1 ms |
 
 **~29x higher throughput on cache hits** vs. origin fetches under 50 concurrent connections. Hits are a pure in-memory hash lookup; misses pay the full cost of a socket connection, request, and read from the origin. The latency tail under load (max ~1.66s on both runs) reflects the single-threaded accept loop — the natural next optimization.
+## Concurrency experiment: thread-per-connection
+
+The single-threaded server degrades under rising concurrency (throughput
+falls as connections pile up behind one accept loop). I added a
+thread-per-connection model (one worker thread per client, a mutex
+guarding the shared cache) and re-ran the sweep.
+
+### Throughput vs. concurrency (cache hits)
+
+| Connections | Single-threaded (req/s) | Threaded (req/s) |
+|-------------|------------------------:|-----------------:|
+| 10          |                  47,769 |           21,240 |
+| 50          |                  38,390 |           16,254 |
+| 100         |                  24,460 |           14,809 |
+| 200         |                  23,739 |           14,203 |
+
+### Cache-miss throughput (50 connections)
+
+| Server          | Requests/sec |
+|-----------------|-------------:|
+| Single-threaded |        1,591 |
+| Threaded        |    **2,149** |
+
+### Takeaway
+
+Threading is a **workload-dependent tradeoff, not a free win**:
+
+- **Cache hits are CPU-cheap** (a hash lookup + memcpy). Per-request
+  thread-creation overhead exceeds the actual work, so the
+  single-threaded server has higher hit throughput.
+- **Cache misses are I/O-bound** (a blocking origin round-trip). Threading
+  lets one thread wait on the origin while others keep serving, giving
+  **~35% higher miss throughput**.
+- Threading also tightened latency under moderate load (e.g. at 50
+  connections the max dropped from ~1.66s to ~18ms).
+
+The right next step is a **thread pool** — reusing a fixed set of workers
+instead of spawning one per connection would remove the per-request
+creation cost that hurts the hit path, while keeping the miss-path
+parallelism.
