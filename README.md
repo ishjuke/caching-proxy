@@ -91,3 +91,30 @@ The right next step is a **thread pool** — reusing a fixed set of workers
 instead of spawning one per connection would remove the per-request
 creation cost that hurts the hit path, while keeping the miss-path
 parallelism.
+## Eviction policy: LRU vs LFU
+
+I implemented a second eviction policy — LFU (least-frequently-used) — and
+compared hit rates against LRU across three synthetic workloads
+(`cache_compare.c`). Cache capacity is 10% of the keyspace; 200,000
+requests over 1,000 keys.
+
+| Workload                     | LRU hit rate | LFU hit rate | Winner       |
+|------------------------------|-------------:|-------------:|--------------|
+| Static skew (Zipf s=1.2)     |        75.6% |        81.3% | LFU  +5.7    |
+| Stronger skew (Zipf s=1.5)   |        91.9% |        93.7% | LFU  +1.8    |
+| Drifting popularity          |        75.4% |     **9.5%** | **LRU +65.9**|
+
+### Takeaway
+
+The right policy depends entirely on the access pattern:
+
+- **Stable popularity:** LFU wins — it protects genuinely hot items from
+  being evicted by short-term churn.
+- **Drifting popularity:** LFU **collapses to 9.5%**. Its frequency counts
+  are permanent baggage — items that were popular in the past accumulate
+  high counts and can't be evicted, while newly-hot items (starting at
+  freq=1) get evicted immediately and never build up. LRU has no such
+  memory and adapts to the drift, holding ~75%.
+
+This is why production caches favor **adaptive** policies (ARC, LRU-K) that
+blend recency and frequency rather than committing to either extreme.
