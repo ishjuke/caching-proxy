@@ -118,3 +118,36 @@ The right policy depends entirely on the access pattern:
 
 This is why production caches favor **adaptive** policies (ARC, LRU-K) that
 blend recency and frequency rather than committing to either extreme.
+## Concurrency: thread-per-connection
+
+I added a thread per connection and benchmarked it against the single-threaded baseline. The result was a tradeoff, not a win:
+
+| Workload         | Single-threaded | Thread-per-connection |
+|------------------|----------------:|----------------------:|
+| Cache HIT (CPU-bound) | baseline   | slower — thread creation overhead dominates the cheap in-memory lookup |
+| Cache MISS (I/O-bound) | baseline  | ~35% faster — origin waits overlap instead of serializing |
+
+The takeaway: thread-per-connection helps only when work is I/O-bound. The real fix is a **thread pool** — reuse a fixed set of workers to get the parallelism without paying creation cost per request. (Planned next step.)
+
+## Eviction policy: LRU vs LFU
+
+I implemented LFU (least-frequently-used) eviction and compared hit rates against LRU across workloads. Under **drifting popularity** (the hot set changes over time), LFU collapsed:
+
+| Policy | Hit rate (drifting popularity) |
+|--------|-------------------------------:|
+| LRU    | ~75%                           |
+| LFU    | ~9.5%                          |
+
+LFU fails here because frequency counts become permanent baggage: an entry that was hot early accumulates a high count and resists eviction long after it's cold, squatting in the cache while useful new entries get evicted. LRU's "recency only" heuristic forgets the distant past, which is the correct behavior under drift.
+
+## Hardening
+
+- **Allocation-failure safety** — every `malloc` is checked; the server degrades gracefully instead of crashing under memory pressure.
+- **Socket timeouts** — slow or dead origins can't hang connections indefinitely.
+- **Truncation-safe caching** — partial/incomplete responses are never cached, preventing cache poisoning from serving a truncated body on later hits.
+
+## Limitations / next steps
+
+- Single-threaded accept loop is the main throughput ceiling under concurrency — a **thread pool** is the planned fix.
+- No cache TTL/expiry yet; entries live until evicted.
+- HTTP parsing is minimal (path-keyed); no header-aware caching semantics.
