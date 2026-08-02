@@ -179,3 +179,61 @@ latency and timeouts still controlled. The lesson isn't "more threads": it's
 that optimal concurrency for I/O-bound work exceeds the core count but is
 bounded by the downstream bottleneck, and past the peak more threads actively
 hurt.
+## Part 4: The event loop (epoll)
+
+Parts 2 and 3 explored *threading* models. The third option is to stop
+mapping connections to threads at all: a single thread running an **epoll
+event loop** over non-blocking sockets, the way nginx works. On a cache miss
+the proxy opens a second non-blocking socket to the origin and drives both the
+client and origin connections through one state machine — no thread ever
+blocks on I/O.
+
+All four servers were recompiled under identical conditions for this
+comparison — `gcc -Wall -Wextra -O2`, per-request logging disabled — so the
+numbers are apples-to-apples.
+
+### Hit throughput (requests/sec)
+
+| Connections | Single-thread | Thread-per-conn | Pool (16) | epoll |
+|-------------|--------------:|----------------:|----------:|------:|
+| 10          |    **59,560** |          33,810 |    47,514 | 55,733 |
+| 50          |    **55,728** |          27,322 |    45,738 | 53,768 |
+| 100         |        51,179 |          24,177 |    42,664 | 39,353 |
+| 200         |        33,383 |          23,285 |    38,025 | 36,338 |
+
+### Latency, stability, and miss throughput
+
+| Server          | Latency @ c50 | Max @ c50 | Timeouts (c50/100/200) | Miss @ c50 |
+|-----------------|--------------:|----------:|:----------------------:|-----------:|
+| Single-thread   |        21.9ms |     1.70s |             4 / 10 / 16 |      1,354 |
+| Thread-per-conn |         1.6ms |    6.25ms |             0 / 0 / 21  |      2,007 |
+| Pool (16)       |         360µs |    5.43ms |         **0 / 0 / 0**   |      2,023 |
+| epoll           |         441µs |    2.31ms |             0 / 0 / 16  |  **2,419** |
+
+### Takeaway
+
+There is no single "fastest" architecture — it depends on what you optimize
+for, and raw throughput alone is a misleading metric:
+
+- **Single-threaded wins raw throughput at low concurrency** (59,560 req/s,
+  beating even epoll) because it has zero coordination overhead — no threads,
+  no locks, no event-loop bookkeeping. The simplest design wins when the
+  workload doesn't stress what it's bad at.
+- **But its throughput number hides catastrophic tail latency.** At 50
+  connections it shows 21.9ms average latency, a **1.70-second** max, and
+  timeouts at every level above 10 connections. A few requests scream through
+  while others starve — the average conceals that.
+- **The event loop and thread pool trade a little peak throughput for
+  enormous stability gains** — sub-millisecond average latency and
+  single-digit-millisecond worst case at the same concurrency, versus
+  single-threaded's 1.7 *seconds*. The pool had zero timeouts at every level.
+- **epoll offers the best overall balance** — strong throughput, excellent
+  latency, and the best miss-path performance (2,419 req/s) — with a single
+  thread and no per-connection cost.
+
+This is why production servers like nginx use an event loop: at scale,
+*predictable* latency matters more than peak throughput, and the event-driven
+model delivers it without spawning a thread per connection. The lesson isn't
+"epoll is fastest" — it's that "fastest" is the wrong question. Tail latency
+and stability under load are what separate these architectures, and you only
+see it when you look past the headline number.

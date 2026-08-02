@@ -366,7 +366,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
     pthread_mutex_unlock(lock);
 
     if (have_response) {
-        printf("HIT  %s\n", key);
+        //printf("HIT  %s\n", key);
     } else {
         // MISS: fetch from the origin WITHOUT holding the lock.
         ssize_t olen = fetch_from_origin(key, send_buf, sizeof(send_buf));
@@ -380,7 +380,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
 
             have_response = 1;
         }
-        printf("MISS %s\n", key);
+        //printf("MISS %s\n", key);
     }
 
     if (have_response) {

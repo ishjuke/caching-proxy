@@ -292,7 +292,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
     pthread_mutex_unlock(lock);
 
     if (have_response) {
-        printf("HIT  %s\n", key);
+        //printf("HIT  %s\n", key);
     } else {
         // MISS: fetch from the origin WITHOUT holding the lock. A network
         // round-trip is slow; holding the mutex across it would serialize every
@@ -309,7 +309,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
 
             have_response = 1;
         }
-        printf("MISS %s\n", key);
+        //printf("MISS %s\n", key);
     }
 
     if (have_response) {

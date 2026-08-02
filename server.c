@@ -307,7 +307,7 @@ int main(void) {
             // HIT: cached value is already a complete raw HTTP response
             raw_response = cached;
             raw_len = strlen(cached);
-            printf("HIT  %s\n", key);
+            //printf("HIT  %s\n", key);
         } else {
             // MISS: fetch the full response from the origin, cache it, relay it
             ssize_t olen = fetch_from_origin(key, origin_response, sizeof(origin_response));
@@ -326,7 +326,7 @@ int main(void) {
                     "502 Bad Gateway\n";
                 raw_len = strlen(raw_response);
             }
-            printf("MISS %s\n", key);
+            //printf("MISS %s\n", key);
         }
 
         // hit and miss converge here: relay the complete response verbatim
