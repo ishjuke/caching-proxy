@@ -1,239 +1,238 @@
 # caching-proxy
 
-A mini CDN — an HTTP caching reverse proxy written in C, running on a Raspberry Pi 5. Requests hit an in-memory cache (hash table + LRU eviction); misses are forwarded to an origin server, cached, and relayed.
+A mini CDN — an HTTP caching reverse proxy written in C, running on a Raspberry
+Pi 5. Requests hit an in-memory cache (hash table + LRU eviction); misses are
+forwarded to an origin server, cached, and relayed.
+
+The point of the project was never just to build one — it was to build it **four
+different ways**, benchmark them rigorously against each other, and understand
+*why* they differ. Along the way it became a study in something more useful than
+"which is fastest": how to measure honestly, and how much the answer depends on
+what you actually optimize for.
+
+---
 
 ## Architecture
 
-- **Hash table** with separate chaining for O(1) key lookup.
-- **LRU eviction** via a doubly-linked recency list + fixed capacity, so lookup *and* eviction are both O(1).
-- **Single-threaded socket server** (`socket`/`bind`/`listen`/`accept`) serving HTTP on port 8080.
-- **Origin forwarding**: on a cache miss the proxy opens an outbound connection to a fixed origin, fetches the response, caches it keyed by request path, and relays it to the client.
+- **Hash table** with separate chaining (djb2) for O(1) key lookup.
+- **LRU eviction** via a doubly-linked recency list + fixed capacity, so lookup
+  *and* eviction are both O(1).
+- **HTTP/1.1 keep-alive** on the client side; persistent origin connections
+  (connection reuse) on the origin side for the threaded and pool servers.
+- **Origin forwarding**: on a miss the proxy fetches from a fixed origin
+  (nginx), caches the response keyed by request path, and relays it.
 
-Build and run:
+Four server architectures share this core and differ only in how they handle
+concurrency:
 
-    gcc -Wall -Wextra -o server server.c
-    ./server
+| Server               | Concurrency model                                        |
+|----------------------|----------------------------------------------------------|
+| `server.c`           | Single-threaded (one accept loop)                        |
+| `server_threaded.c`  | Thread-per-connection                                    |
+| `server_pool.c`      | Fixed thread pool (16 workers + job queue)               |
+| `server_epoll.c`     | Single-threaded epoll event loop (nginx-style)           |
 
-## Benchmarks
+Build any of them:
 
-Measured on a **Raspberry Pi 5 (8GB)** — Broadcom BCM2712 (quad-core Arm Cortex-A76 @ 2.4GHz), Raspberry Pi OS Lite (64-bit), booting from microSD. Proxy compiled with `gcc -Wall -Wextra`.
+    gcc -Wall -Wextra -O2 -o server server.c
+    gcc -Wall -Wextra -O2 -pthread -o server_threaded server_threaded.c
+    gcc -Wall -Wextra -O2 -pthread -o server_pool server_pool.c
+    gcc -Wall -Wextra -O2 -o server_epoll server_epoll.c
+    ./server            # (or whichever)
 
-### Setup
+---
 
-- **Proxy** (this project): single-threaded, port 8080.
-- **Origin server:** Python's built-in `http.server` on port 9000, serving small static files:
+## Part 1: The cache
 
-      cd origin-test && python3 -m http.server 9000
+A hash table for lookup, an LRU list for eviction, a socket server, and origin
+forwarding. The first question was simple: how much does caching actually buy
+you? Measured on a cache hit (in-memory) versus a miss (full origin fetch), the
+hit path was roughly **29x** the throughput of the miss path — which is exactly
+what you'd expect, since a hit is a hash lookup and a memcpy while a miss pays
+for a network round-trip.
 
-- **Load generator:** wrk (installed via apt), 2 threads / 50 connections / 10s.
+## Part 2: Eviction policy — LRU vs LFU
 
-### Cache HIT (served from the in-memory LRU cache)
+I implemented a second policy, LFU (least-frequently-used), and compared hit
+rates across three synthetic workloads (`cache_compare.c`) — 200,000 requests
+over 1,000 keys, cache capacity 10% of the keyspace.
 
-    wrk -t2 -c50 -d10s http://localhost:8080/index.html
+| Workload                   | LRU hit rate | LFU hit rate | Winner        |
+|----------------------------|-------------:|-------------:|---------------|
+| Static skew (Zipf s=1.2)   |        75.6% |        81.3% | LFU  +5.7     |
+| Stronger skew (Zipf s=1.5) |        91.9% |        93.7% | LFU  +1.8     |
+| Drifting popularity        |        75.4% |     **9.5%** | **LRU +65.9** |
 
-### Cache MISS (forced origin fetch on every request)
+**Takeaway.** Under stable popularity, LFU wins — it protects genuinely hot
+items. But under *drifting* popularity, LFU **collapses to 9.5%**: old frequency
+counts become permanent baggage. Items that were popular in the past accumulate
+high counts and can't be evicted, while newly-hot items (starting at freq=1) get
+evicted immediately and never build up. LRU has no such memory and adapts,
+holding ~75%. This is why production caches favor adaptive policies (ARC, LRU-K)
+that blend recency and frequency rather than committing to either extreme.
 
-A Lua script appends a random query string per request so no two requests share a cache key, forcing a full origin round-trip each time:
+## Part 3 & 4: Four concurrency architectures
 
-    -- miss.lua
-    request = function()
-       local path = "/index.html?nocache=" .. math.random(1, 100000000)
-       return wrk.format("GET", path)
-    end
+Single-threaded degrades under load, so I built thread-per-connection, then a
+thread pool, then an epoll event loop — each a response to what the previous
+one's benchmarks revealed. The full head-to-head comparison is below, but two
+findings from the build are worth stating on their own:
 
-    wrk -t2 -c50 -d10s -s miss.lua http://localhost:8080/index.html
+- **Thread-per-connection is a workload-dependent tradeoff, not a free win.**
+  Naively it "should" beat single-threaded, but for CPU-cheap cache *hits* the
+  per-connection thread cost matters; where it earns its keep is the I/O-bound
+  *miss* path, where waiting on the origin overlaps across threads.
+- **The thread pool** removes the per-request thread-creation cost by reusing a
+  fixed set of workers, and (with persistent per-worker origin connections)
+  reuses upstream connections across the whole process lifetime.
+- **The epoll event loop** stops mapping connections to threads at all: one
+  thread, non-blocking sockets, a state machine that on a miss drives *both* the
+  client and origin sockets without ever blocking.
 
-### Results
+---
 
-| Scenario   | Requests/sec | Avg latency |
-|------------|-------------:|------------:|
-| Cache HIT  |      ~46,240 |     15.0 ms |
-| Cache MISS |       ~1,590 |     16.1 ms |
+## Methodology (read this before the numbers)
 
-**~29x higher throughput on cache hits** vs. origin fetches under 50 concurrent connections. Hits are a pure in-memory hash lookup; misses pay the full cost of a socket connection, request, and read from the origin. The latency tail under load (max ~1.66s on both runs) reflects the single-threaded accept loop — the natural next optimization.
-## Concurrency experiment: thread-per-connection
+The first version of this benchmark had real flaws, flagged by an experienced
+reviewer, and the numbers below are the **corrected** measurements. What changed,
+and why it matters:
 
-The single-threaded server degrades under rising concurrency (throughput
-falls as connections pile up behind one accept loop). I added a
-thread-per-connection model (one worker thread per client, a mutex
-guarding the shared cache) and re-ran the sweep.
+- **Off-box load generation.** Originally the load generator (`wrk`), the proxy,
+  and the origin all ran on the same 4-core Pi, competing for CPU — which
+  contaminates every cross-architecture comparison. Now `wrk` runs on a separate
+  laptop, wired to the Pi over Ethernet (verified: 1000-ping flood, 0% loss,
+  ~0.3ms).
+- **A real origin.** The original origin was `python3 -m http.server`, which is
+  single-threaded and tops out around 1,500–2,400 req/s — so every miss number
+  was really measuring *Python's* ceiling, not the proxy. Replaced with **nginx**
+  serving static files.
+- **HTTP keep-alive.** The original server closed the connection after every
+  response (HTTP/1.0). Over a real network that means a full TCP handshake *per
+  request*, which dominates the measurement. Adding HTTP/1.1 keep-alive (client
+  and origin side) removed that, and dropped single-connection latency from
+  ~1.8ms to ~400us.
+- **Little's Law reconciles.** The corrected numbers are self-consistent:
+  at 50 connections and 62,304 req/s (epoll), Little's Law predicts
+  50/62304 ≈ 802us average latency; measured average was 793us. The original
+  numbers were off by 3–14x, which was the tell that something in the setup was
+  wrong.
+- **Full latency distribution.** Reporting p50/p99 (via `wrk --latency`), not
+  just average/max — because the whole conclusion is about tail latency, and
+  average/max are the two numbers that hide the tail worst.
 
-### Throughput vs. concurrency (cache hits)
+All four servers were compiled identically (`-O2`, per-request logging disabled)
+and measured in one session against the same nginx origin over the same wired
+link.
 
-| Connections | Single-threaded (req/s) | Threaded (req/s) |
-|-------------|------------------------:|-----------------:|
-| 10          |                  47,769 |           21,240 |
-| 50          |                  38,390 |           16,254 |
-| 100         |                  24,460 |           14,809 |
-| 200         |                  23,739 |           14,203 |
+---
 
-### Cache-miss throughput (50 connections)
-
-| Server          | Requests/sec |
-|-----------------|-------------:|
-| Single-threaded |        1,591 |
-| Threaded        |    **2,149** |
-
-### Takeaway
-
-Threading is a **workload-dependent tradeoff, not a free win**:
-
-- **Cache hits are CPU-cheap** (a hash lookup + memcpy). Per-request
-  thread-creation overhead exceeds the actual work, so the
-  single-threaded server has higher hit throughput.
-- **Cache misses are I/O-bound** (a blocking origin round-trip). Threading
-  lets one thread wait on the origin while others keep serving, giving
-  **~35% higher miss throughput**.
-- Threading also tightened latency under moderate load (e.g. at 50
-  connections the max dropped from ~1.66s to ~18ms).
-
-The right next step is a **thread pool** — reusing a fixed set of workers
-instead of spawning one per connection would remove the per-request
-creation cost that hurts the hit path, while keeping the miss-path
-parallelism.
-## Eviction policy: LRU vs LFU
-
-I implemented a second eviction policy — LFU (least-frequently-used) — and
-compared hit rates against LRU across three synthetic workloads
-(`cache_compare.c`). Cache capacity is 10% of the keyspace; 200,000
-requests over 1,000 keys.
-
-| Workload                     | LRU hit rate | LFU hit rate | Winner       |
-|------------------------------|-------------:|-------------:|--------------|
-| Static skew (Zipf s=1.2)     |        75.6% |        81.3% | LFU  +5.7    |
-| Stronger skew (Zipf s=1.5)   |        91.9% |        93.7% | LFU  +1.8    |
-| Drifting popularity          |        75.4% |     **9.5%** | **LRU +65.9**|
-
-### Takeaway
-
-The right policy depends entirely on the access pattern:
-
-- **Stable popularity:** LFU wins — it protects genuinely hot items from
-  being evicted by short-term churn.
-- **Drifting popularity:** LFU **collapses to 9.5%**. Its frequency counts
-  are permanent baggage — items that were popular in the past accumulate
-  high counts and can't be evicted, while newly-hot items (starting at
-  freq=1) get evicted immediately and never build up. LRU has no such
-  memory and adapts to the drift, holding ~75%.
-
-This is why production caches favor **adaptive** policies (ARC, LRU-K) that
-blend recency and frequency rather than committing to either extreme.
-## Part 3: The thread pool
-
-Part 2 found that thread-per-connection was the wrong fix — per-request
-thread-creation overhead erased its gains on CPU-cheap cache hits. The fix
-is a **thread pool**: a fixed set of worker threads pull client connections
-from a shared, mutex- and condition-variable-guarded queue, so parallelism
-comes without paying to spawn a thread per request.
-
-### Throughput vs. concurrency (cache hits)
-
-| Connections | Single-threaded | Thread-per-conn | Pool (16 workers) |
-|-------------|----------------:|----------------:|------------------:|
-| 10          |          47,769 |          21,240 |            31,218 |
-| 50          |          38,390 |          16,254 |            35,814 |
-| 100         |          24,460 |          14,809 |        **29,113** |
-| 200         |          23,739 |          14,203 |        **26,026** |
-
-The pool beats thread-per-connection at every level (no per-request thread
-creation), and overtakes single-threaded under real concurrency (100+
-connections) where the single accept loop becomes the bottleneck.
-
-### Cache-miss throughput (50 connections)
-
-| Server                | Requests/sec |
-|-----------------------|-------------:|
-| Single-threaded       |        1,591 |
-| Thread-per-connection |        2,149 |
-| Pool (16 workers)     |        2,334 |
-
-The pool keeps the miss-path parallelism (~47% over single-threaded) — while
-one worker blocks on the origin, others keep serving.
-
-### Pool-size sweep (miss workload, 50 connections)
-
-The Pi has 4 cores. I swept worker count to find the optimum:
-
-| Workers | Requests/sec | Avg latency | Timeouts |
-|--------:|-------------:|------------:|---------:|
-|       4 |        1,981 |       25 ms |        0 |
-|       8 |        2,098 |       37 ms |        0 |
-|      16 |        2,334 |       97 ms |        0 |
-|      32 |    **2,453** |      180 ms |        6 |
-|      64 |        1,991 |      187 ms |       34 |
-
-### Takeaway
-
-A classic I/O-bound tuning curve — it rises, peaks, and falls:
-
-- Throughput climbs **past the 4 physical cores**, peaking at ~32 workers,
-  because I/O-bound workers spend most of their time *blocked on the origin*
-  rather than using CPU — so oversubscribing cores is correct, up to a point.
-- Beyond the peak it **collapses**: 64 workers fall back to 1,991 req/s with
-  5× the timeouts, as scheduling overhead, lock contention, and origin
-  saturation overwhelm the gains.
-- Tail latency degrades steadily well before the throughput peak.
-
-The practical sweet spot is **~16 workers** — near-peak throughput with
-latency and timeouts still controlled. The lesson isn't "more threads": it's
-that optimal concurrency for I/O-bound work exceeds the core count but is
-bounded by the downstream bottleneck, and past the peak more threads actively
-hurt.
-## Part 4: The event loop (epoll)
-
-Parts 2 and 3 explored *threading* models. The third option is to stop
-mapping connections to threads at all: a single thread running an **epoll
-event loop** over non-blocking sockets, the way nginx works. On a cache miss
-the proxy opens a second non-blocking socket to the origin and drives both the
-client and origin connections through one state machine — no thread ever
-blocks on I/O.
-
-All four servers were recompiled under identical conditions for this
-comparison — `gcc -Wall -Wextra -O2`, per-request logging disabled — so the
-numbers are apples-to-apples.
+## The four-way comparison
 
 ### Hit throughput (requests/sec)
 
-| Connections | Single-thread | Thread-per-conn | Pool (16) | epoll |
-|-------------|--------------:|----------------:|----------:|------:|
-| 10          |    **59,560** |          33,810 |    47,514 | 55,733 |
-| 50          |    **55,728** |          27,322 |    45,738 | 53,768 |
-| 100         |        51,179 |          24,177 |    42,664 | 39,353 |
-| 200         |        33,383 |          23,285 |    38,025 | 36,338 |
+| Connections | Single-thread | Thread-per-conn | Pool (16) |  epoll |
+|-------------|--------------:|----------------:|----------:|-------:|
+| 10          |         1,828 |          24,855 |    22,348 | 19,138 |
+| 50          |         2,547 |     **115,107** |    45,162 | 62,304 |
+| 100         |         2,806 |     **116,681** |    46,468 | 81,874 |
+| 200         |         2,810 |          79,125 |    47,371 | 77,507 |
 
-### Latency, stability, and miss throughput
+### Hit-path tail latency (p99)
 
-| Server          | Latency @ c50 | Max @ c50 | Timeouts (c50/100/200) | Miss @ c50 |
-|-----------------|--------------:|----------:|:----------------------:|-----------:|
-| Single-thread   |        21.9ms |     1.70s |             4 / 10 / 16 |      1,354 |
-| Thread-per-conn |         1.6ms |    6.25ms |             0 / 0 / 21  |      2,007 |
-| Pool (16)       |         360µs |    5.43ms |         **0 / 0 / 0**   |      2,023 |
-| epoll           |         441µs |    2.31ms |             0 / 0 / 16  |  **2,419** |
+| Connections | Single-thread | Thread-per-conn | Pool (16) |    epoll |
+|-------------|--------------:|----------------:|----------:|---------:|
+| 50          |         1.66s |          85.8ms |     109ms | **1.57ms** |
+| 100         |         1.10s |          1.74ms |     168ms |   2.22ms |
+| 200         |         830ms |          1.71ms |     371ms |   3.53ms |
 
-### Takeaway
+### Miss throughput (50 connections)
 
-There is no single "fastest" architecture — it depends on what you optimize
-for, and raw throughput alone is a misleading metric:
+| Server                | Requests/sec |
+|-----------------------|-------------:|
+| Single-threaded       |        1,354 |
+| Thread-per-connection |       39,899 |
+| Pool (16)             |       37,967 |
+| epoll                 |       16,403 |
 
-- **Single-threaded wins raw throughput at low concurrency** (59,560 req/s,
-  beating even epoll) because it has zero coordination overhead — no threads,
-  no locks, no event-loop bookkeeping. The simplest design wins when the
-  workload doesn't stress what it's bad at.
-- **But its throughput number hides catastrophic tail latency.** At 50
-  connections it shows 21.9ms average latency, a **1.70-second** max, and
-  timeouts at every level above 10 connections. A few requests scream through
-  while others starve — the average conceals that.
-- **The event loop and thread pool trade a little peak throughput for
-  enormous stability gains** — sub-millisecond average latency and
-  single-digit-millisecond worst case at the same concurrency, versus
-  single-threaded's 1.7 *seconds*. The pool had zero timeouts at every level.
-- **epoll offers the best overall balance** — strong throughput, excellent
-  latency, and the best miss-path performance (2,419 req/s) — with a single
-  thread and no per-connection cost.
+(Threaded and pool reuse origin connections, so their miss throughput reflects
+real concurrent I/O — ~18x the old connect-per-miss numbers. epoll still opens a
+fresh origin connection per miss; see *Known limitations*.)
 
-This is why production servers like nginx use an event loop: at scale,
-*predictable* latency matters more than peak throughput, and the event-driven
-model delivers it without spawning a thread per connection. The lesson isn't
-"epoll is fastest" — it's that "fastest" is the wrong question. Tail latency
-and stability under load are what separate these architectures, and you only
-see it when you look past the headline number.
+---
+
+## What the numbers say
+
+There is no single "fastest" architecture. Keep-alive **reshuffled the entire
+standings** versus a naive close-per-request setup, and each server now wins a
+different thing:
+
+**1. Single-threaded + keep-alive collapses under concurrency.** At 50
+connections it manages ~2,547 req/s — barely above its single-connection number
+— with a **1.66-second** p99. Keep-alive makes it *serialize*: the server stays
+glued to one persistent connection's read-respond loop while the other 49 wait,
+instead of round-robining by closing after each request. This is the one server
+keep-alive actively *hurt* under load.
+
+**2. Thread-per-connection has the highest peak (116,681 req/s).** With
+keep-alive, a thread is spawned per *connection* and lives for that connection's
+entire lifetime of many requests — so the thread-creation cost is amortized
+across thousands of requests instead of paid per request. This *inverts* its
+pre-keep-alive result, where it was the slowest on hits. But it falls off at 200
+connections (79k) as 200 threads contend for 4 cores.
+
+**3. The thread pool scales flattest and most predictably** (22k → 47k, steady
+across concurrency) because its resource use is bounded at 16 workers. It doesn't
+hit the highest peak, and its hit-path tail latency is the worst at moderate
+concurrency (the job queue adds variance), but it never collapses and never
+thrashes.
+
+**4. epoll has by far the best latency discipline.** 1.57ms p99 at 50
+connections, versus tens to hundreds of milliseconds for everyone else, scaling
+smoothly from 19k to 82k — and it was the **only** server with zero socket errors
+across every test. It doesn't win peak throughput, but it wins *consistency*,
+which is exactly why production servers like nginx use an event loop: at scale,
+predictable latency matters more than peak throughput, and the event-driven model
+delivers it without a thread per connection.
+
+**The real lesson: "fastest" is the wrong question.** Peak throughput picks
+thread-per-connection; predictable scaling picks the pool; tail latency and
+stability pick the event loop; and a single-threaded server that looked fine
+without keep-alive collapses with it. You only see any of this by measuring the
+distribution under load — not the headline number.
+
+---
+
+## Known limitations
+
+Named honestly, because a caching proxy has correctness requirements beyond raw
+performance:
+
+- **No Cache-Control / Expires / TTL.** Responses are cached by path and kept
+  indefinitely — a `no-store` response would be cached forever. This is a
+  correctness gap distinct from the performance work.
+- **No request coalescing.** N concurrent misses on the same cold key send N
+  origin requests (a cache stampede); nginx has `proxy_cache_lock` for exactly
+  this. The `miss.lua` workload uses unique keys, so this case isn't exercised.
+- **epoll origin keep-alive not implemented.** The event-loop server opens a
+  fresh origin connection per miss. Correct origin keep-alive in a single-threaded
+  event loop requires an explicit *pool* of upstream connections (as nginx's
+  `upstream ... keepalive` does), tracking which client each origin socket serves
+  and matching responses back asynchronously — a single shared connection would
+  serialize all misses and regress throughput. This is the correct next step and
+  is left as future work.
+- **~1% read errors under 100%-miss synthetic load** at 30k+ req/s. Instrumenting
+  the servers (per-break-path counters) confirmed the proxy closes **zero** client
+  connections under load; the errors are TCP-layer resets on the load-generator
+  side, inherent to sustained synthetic miss traffic, not a server defect.
+
+---
+
+## Files
+
+- `cache.c` — standalone hash table + LRU (Part 1).
+- `cache_compare.c` — LRU vs LFU hit-rate comparison across workloads (Part 2).
+- `server.c` — single-threaded proxy.
+- `server_threaded.c` — thread-per-connection.
+- `server_pool.c` — fixed thread pool + job queue.
+- `server_epoll.c` — epoll event loop.
+- `miss.lua` — `wrk` script generating unique keys to force cache misses.

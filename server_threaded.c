@@ -187,7 +187,7 @@ void cache_free(lru_cache *c) {
 // Idle timeout on a kept-alive CLIENT connection. In the threaded model an
 // idle client only wedges its own thread, not the whole server — but without
 // this, that thread and its fds live forever and you leak both.
-#define IDLE_TIMEOUT_SEC 5
+#define IDLE_TIMEOUT_SEC 15
 
 // Timeout on the ORIGIN socket. Mandatory now that we ask nginx for keep-alive:
 // nginx no longer closes to signal "done", so a framing bug would otherwise
@@ -307,7 +307,7 @@ static ssize_t origin_fetch_once(const char *path, char *out, size_t out_size) {
         if (r <= 0) {
             // Nothing received yet => almost certainly a pooled socket nginx had
             // already timed out. Retryable.
-            return total == 0 ? -1 : -2;
+            return -1;   // EOF mid-headers: recycled keepalive conn, retryable
         }
         total += (size_t)r;
         out[total] = '\0';
@@ -425,15 +425,6 @@ static ssize_t normalize_response(char *resp, size_t len, size_t cap) {
 
 // A connection can only be reused if the client can find the end of the
 // response without waiting for EOF: Content-Length present, no Connection: close.
-static int can_keep_alive(const char *resp) {
-    const char *end = strstr(resp, "\r\n\r\n");
-    if (!end) return 0;
-    size_t hlen = (size_t)(end - resp) + 2;
-
-    if (!find_ci(resp, hlen, "\r\ncontent-length:")) return 0;
-    if (find_ci(resp, hlen, "connection: close"))    return 0;
-    return 1;
-}
 
 // An HTTP/1.0 response with no explicit keep-alive means "closes when done" to
 // every client. One-byte edit, since the version tokens are the same length.
@@ -516,7 +507,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
             // Cached values were normalized before insertion, so this only
             // re-checks framing — and it runs on our private copy, not on
             // cache memory, so no lock is needed for it.
-            keep_alive = can_keep_alive(send_buf);
+            keep_alive = !wants_close;
             //printf("HIT  %s\n", key);
         } else {
             // MISS: fetch from the origin WITHOUT holding the lock. A network
@@ -538,7 +529,7 @@ void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
                 pthread_mutex_unlock(lock);
 
                 have_response = 1;
-                keep_alive = can_keep_alive(send_buf);
+                keep_alive = !wants_close;
             }
             //printf("MISS %s\n", key);
         }

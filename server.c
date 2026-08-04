@@ -191,7 +191,7 @@ void cache_free(lru_cache *c) {
 // connection before giving up on it. This is what stops keep-alive from
 // leaking connections: a client that stops talking without closing gets
 // timed out rather than held forever.
-#define IDLE_TIMEOUT_SEC 5
+#define IDLE_TIMEOUT_SEC 15
 
 // Timeout on the ORIGIN socket. Mandatory now that we ask nginx to keep the
 // connection open: nginx will no longer close to signal "done", so a bug in
@@ -308,7 +308,7 @@ static ssize_t origin_fetch_once(const char *path, char *out, size_t out_size) {
         if (r <= 0) {
             // Nothing received yet => this was almost certainly a keep-alive
             // socket nginx had already timed out. Retryable.
-            return total == 0 ? -1 : -2;
+            return -1;   // EOF mid-headers: recycled keepalive conn, retryable
         }
         total += (size_t)r;
         out[total] = '\0';
@@ -435,15 +435,6 @@ static ssize_t normalize_response(char *resp, size_t len, size_t cap) {
 
 // A connection can only be reused if the client can tell where the response
 // ends without waiting for EOF: Content-Length present, no Connection: close.
-static int can_keep_alive(const char *resp) {
-    const char *end = strstr(resp, "\r\n\r\n");
-    if (!end) return 0;
-    size_t hlen = (size_t)(end - resp) + 2;
-
-    if (!find_ci(resp, hlen, "\r\ncontent-length:")) return 0;
-    if (find_ci(resp, hlen, "connection: close"))    return 0;
-    return 1;
-}
 
 // An HTTP/1.0 response with no explicit keep-alive means "closes when done" to
 // every client, wrk included — relay that and the client hangs up after every
@@ -533,7 +524,7 @@ int main(void) {
                 // already normalized before it went into the cache.
                 raw_response = cached;
                 raw_len = strlen(cached);
-                keep_alive = can_keep_alive(cached);
+                keep_alive = !wants_close;
                 //printf("HIT  [%s]\n", key);
             } else {
                 ssize_t olen = fetch_from_origin(key, origin_response, sizeof(origin_response));
@@ -548,7 +539,7 @@ int main(void) {
                     cache_set(cache, key, origin_response);   // cache the normalized form
                     raw_response = origin_response;
                     raw_len = (size_t)olen;
-                    keep_alive = can_keep_alive(origin_response);
+                    keep_alive = !wants_close;
                 } else {
                     // origin unreachable or unusable — gateway error, then hang up.
                     // NOTE: string literal, read-only. Never pass it to
