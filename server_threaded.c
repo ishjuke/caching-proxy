@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>       // strncasecmp
 #include <unistd.h>        // read, write, close
 #include <arpa/inet.h>     // sockaddr_in, htons, etc.
 #include <netdb.h>         // getaddrinfo
+#include <errno.h>
+#include <sys/time.h>      // struct timeval (SO_RCVTIMEO)
 #include <pthread.h>       // threads + mutex
 
 // ============================================================
@@ -172,14 +175,29 @@ void cache_free(lru_cache *c) {
 }
 
 // ============================================================
-//  Reverse proxy (Week 3) + threading (Week 4 #1)
+//  Reverse proxy (Week 3) + threading (Week 4 #1) + keep-alive
 // ============================================================
 
 #define PORT 8080
 #define BUFFER_SIZE 8192
 
 #define ORIGIN_HOST "localhost"
-#define ORIGIN_PORT "9000"
+#define ORIGIN_PORT "80"          // nginx
+
+// Idle timeout on a kept-alive CLIENT connection. In the threaded model an
+// idle client only wedges its own thread, not the whole server — but without
+// this, that thread and its fds live forever and you leak both.
+#define IDLE_TIMEOUT_SEC 5
+
+// Timeout on the ORIGIN socket. Mandatory now that we ask nginx for keep-alive:
+// nginx no longer closes to signal "done", so a framing bug would otherwise
+// block until its keepalive_timeout (75s) expires.
+#define ORIGIN_TIMEOUT_SEC 5
+
+// Kept identical to server.c so the version comparison stays apples-to-apples.
+// Unlike the single-threaded build, this one doesn't NEED a cap — each
+// connection has its own thread, so nobody can monopolize the server.
+#define MAX_KEEPALIVE_REQUESTS 100
 
 void parse_path(const char *request, char *out, size_t out_size) {
     char fmt[32];
@@ -192,7 +210,49 @@ void parse_path(const char *request, char *out, size_t out_size) {
     }
 }
 
-ssize_t fetch_from_origin(const char *path, char *response_out, size_t out_size) {
+// write-all helper. Returns 0 on success, -1 if the peer went away mid-write —
+// which the keep-alive loop needs so it can stop instead of reading again.
+static int write_all(int fd, const char *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t w = write(fd, buf + total, len - total);
+        if (w <= 0) return -1;
+        total += w;
+    }
+    return 0;
+}
+
+// Case-insensitive substring search over a bounded region (headers only —
+// never let one of these run into the body, which can contain anything).
+static const char *find_ci(const char *hay, size_t n, const char *needle) {
+    size_t m = strlen(needle);
+    if (m > n) return NULL;
+    for (size_t i = 0; i + m <= n; i++) {
+        if (strncasecmp(hay + i, needle, m) == 0) return hay + i;
+    }
+    return NULL;
+}
+
+// ------------------------------------------------------------
+//  Origin connection — persistent, PER THREAD
+// ------------------------------------------------------------
+// __thread gives every worker its own copy of this variable. Thread A's origin
+// socket and thread B's are different fds and neither can see the other's, so
+// the reuse needs no mutex — the isolation is what removes the race, not a lock.
+//
+// Lifetime caveat: in THIS file a thread is created per client connection and
+// exits when that connection ends, so the reuse spans the requests of one
+// keep-alive connection. In server_pool.c the workers are long-lived, so the
+// same code yields a true pool of THREAD_POOL_SIZE origin connections.
+// Either way the thread MUST close its fd before exiting — see client_thread().
+
+static __thread int g_origin_fd = -1;
+
+static void origin_drop(void) {
+    if (g_origin_fd >= -1) { close(g_origin_fd); g_origin_fd = -1; }
+}
+
+static int origin_connect(void) {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -203,53 +263,194 @@ ssize_t fetch_from_origin(const char *path, char *response_out, size_t out_size)
         return -1;
     }
 
-    int origin_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (origin_fd < 0) {
-        perror("socket");
-        freeaddrinfo(res);
-        return -1;
-    }
-    if (connect(origin_fd, res->ai_addr, res->ai_addrlen) < 0) {
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { perror("socket"); freeaddrinfo(res); return -1; }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         perror("connect");
-        close(origin_fd);
+        close(fd);
         freeaddrinfo(res);
         return -1;
     }
     freeaddrinfo(res);
 
-    char request[2048];
-    int req_len = snprintf(request, sizeof(request),
-        "GET %s HTTP/1.0\r\n"
-        "Host: %s\r\n"
-        "\r\n",
-        path, ORIGIN_HOST);
-
-    ssize_t sent = 0;
-    while (sent < req_len) {
-        ssize_t w = write(origin_fd, request + sent, req_len - sent);
-        if (w <= 0) { close(origin_fd); return -1; }
-        sent += w;
-    }
-
-    ssize_t total = 0;
-    while ((size_t)total < out_size - 1) {
-        ssize_t r = read(origin_fd, response_out + total, out_size - 1 - (size_t)total);
-        if (r < 0) { close(origin_fd); return -1; }
-        if (r == 0) break;   // EOF — origin done
-        total += r;
-    }
-
-    close(origin_fd);
-    return total;
+    struct timeval tv = { .tv_sec = ORIGIN_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return fd;
 }
 
-static void write_all(int fd, const char *buf, size_t len) {
+// One attempt on this thread's current origin socket.
+//   >0  bytes of a complete response in `out`
+//   -1  socket looks stale and nothing was received — safe to retry fresh
+//   -2  a real failure — do not retry
+static ssize_t origin_fetch_once(const char *path, char *out, size_t out_size) {
+    char request[2048];
+    int req_len = snprintf(request, sizeof(request),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        path, ORIGIN_HOST);
+    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return -2;
+
+    if (write_all(g_origin_fd, request, (size_t)req_len) < 0) return -1;
+
+    // We can no longer read until EOF: nginx holds the connection open, so
+    // there is no EOF. Content-Length is what tells us where the body ends.
     size_t total = 0;
-    while (total < len) {
-        ssize_t w = write(fd, buf + total, len - total);
-        if (w <= 0) break;
-        total += w;
+    char *hdr_end = NULL;
+
+    while (!hdr_end) {
+        if (total >= out_size - 1) return -2;         // headers bigger than our buffer
+        ssize_t r = read(g_origin_fd, out + total, out_size - 1 - total);
+        if (r <= 0) {
+            // Nothing received yet => almost certainly a pooled socket nginx had
+            // already timed out. Retryable.
+            return total == 0 ? -1 : -2;
+        }
+        total += (size_t)r;
+        out[total] = '\0';
+        hdr_end = strstr(out, "\r\n\r\n");
     }
+    size_t header_len = (size_t)(hdr_end - out) + 4;  // includes the blank line
+
+    const char *cl = find_ci(out, header_len, "\r\ncontent-length:");
+    if (!cl) return -2;    // chunked or something we don't handle: refuse, don't guess
+
+    long long body_len = strtoll(cl + strlen("\r\ncontent-length:"), NULL, 10);
+    if (body_len < 0) return -2;
+
+    size_t need = header_len + (size_t)body_len;
+    if (need > out_size - 1) return -2;               // too big to buffer/cache
+
+    // Read exactly the rest of the body and no further. Reading past `need`
+    // would swallow the front of the NEXT response on this reused connection
+    // and desynchronise everything after it.
+    while (total < need) {
+        ssize_t r = read(g_origin_fd, out + total, need - total);
+        if (r <= 0) return -2;
+        total += (size_t)r;
+    }
+    out[total] = '\0';
+
+    if (find_ci(out, header_len, "connection: close")) origin_drop();
+
+    return (ssize_t)total;
+}
+
+// Fetch `path` from the origin, reusing this thread's connection when alive.
+ssize_t fetch_from_origin(const char *path, char *response_out, size_t out_size) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (g_origin_fd < 0) {
+            g_origin_fd = origin_connect();
+            if (g_origin_fd < 0) return -1;
+        }
+
+        ssize_t r = origin_fetch_once(path, response_out, out_size);
+        if (r > 0) return r;
+
+        origin_drop();
+        if (r == -2) return -1;   // real failure — retrying won't help
+        // r == -1: stale pooled socket. Retry once with a fresh connection.
+        // Safe: nothing of the response arrived, and GET is idempotent.
+    }
+    return -1;
+}
+
+// ------------------------------------------------------------
+//  Response normalization
+// ------------------------------------------------------------
+// Connection (and friends) are HOP-BY-HOP headers: they describe one TCP link,
+// not the end-to-end message. Relaying nginx's Connection header to the client
+// is what told wrk to hang up — and caching it would serve that close directive
+// forever. So: strip them, and state our own.
+
+static int is_hop_by_hop(const char *line, size_t len) {
+    static const char *names[] = {
+        "connection:", "keep-alive:", "proxy-connection:",
+        "transfer-encoding:", "upgrade:", "te:", "trailer:", NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        size_t n = strlen(names[i]);
+        if (len >= n && strncasecmp(line, names[i], n) == 0) return 1;
+    }
+    return 0;
+}
+
+// Rewrites `resp` in place. Returns the new length, or -1 if unusable.
+// Thread-safe: touches only the caller's buffer and its own stack.
+static ssize_t normalize_response(char *resp, size_t len, size_t cap) {
+    char *hdr_end = strstr(resp, "\r\n\r\n");
+    if (!hdr_end) return -1;
+
+    size_t header_block = (size_t)(hdr_end - resp) + 2;   // through last header's CRLF
+    size_t body_off     = header_block + 2;
+    size_t body_len     = len - body_off;
+
+    char tmp[BUFFER_SIZE * 4];
+    size_t w = 0;
+    size_t i = 0;
+    int first = 1;   // the status line is not a header — never drop it
+
+    while (i < header_block) {
+        size_t j = i;
+        while (j + 1 < header_block && !(resp[j] == '\r' && resp[j + 1] == '\n')) j++;
+        size_t line_len = j - i;
+
+        if (first || !is_hop_by_hop(resp + i, line_len)) {
+            if (w + line_len + 2 > sizeof(tmp)) return -1;
+            memcpy(tmp + w, resp + i, line_len);
+            w += line_len;
+            tmp[w++] = '\r';
+            tmp[w++] = '\n';
+        }
+        first = 0;
+        i = j + 2;
+    }
+
+    static const char conn_hdr[] = "Connection: keep-alive\r\n\r\n";
+    if (w + sizeof(conn_hdr) - 1 + body_len > sizeof(tmp)) return -1;
+    memcpy(tmp + w, conn_hdr, sizeof(conn_hdr) - 1);
+    w += sizeof(conn_hdr) - 1;
+
+    memcpy(tmp + w, resp + body_off, body_len);
+    w += body_len;
+
+    if (w + 1 > cap) return -1;
+    memcpy(resp, tmp, w);
+    resp[w] = '\0';
+    return (ssize_t)w;
+}
+
+// A connection can only be reused if the client can find the end of the
+// response without waiting for EOF: Content-Length present, no Connection: close.
+static int can_keep_alive(const char *resp) {
+    const char *end = strstr(resp, "\r\n\r\n");
+    if (!end) return 0;
+    size_t hlen = (size_t)(end - resp) + 2;
+
+    if (!find_ci(resp, hlen, "\r\ncontent-length:")) return 0;
+    if (find_ci(resp, hlen, "connection: close"))    return 0;
+    return 1;
+}
+
+// An HTTP/1.0 response with no explicit keep-alive means "closes when done" to
+// every client. One-byte edit, since the version tokens are the same length.
+static void upgrade_to_http11(char *resp) {
+    if (strncmp(resp, "HTTP/1.0", 8) == 0) resp[7] = '1';
+}
+
+// Did the CLIENT ask us to close? Its request is the authority on the client
+// link, the same way our request is the authority on the origin link.
+static int client_requested_close(const char *req, size_t len) {
+    const char *end = strstr(req, "\r\n\r\n");
+    size_t hlen = end ? (size_t)(end - req) + 2 : len;
+    if (find_ci(req, hlen, "\r\nconnection: close")) return 1;
+    const char *eol = strstr(req, "\r\n");
+    size_t line = eol ? (size_t)(eol - req) : len;
+    if (find_ci(req, line, "HTTP/1.0") && !find_ci(req, hlen, "connection: keep-alive")) return 1;
+    return 0;
 }
 
 // Per-connection context handed to each worker thread. We heap-allocate one
@@ -264,78 +465,122 @@ typedef struct {
 // All the per-request work, run by one thread, fully independent of others
 // except where it touches the shared cache (guarded by the mutex).
 void handle_client(int client_fd, lru_cache *cache, pthread_mutex_t *lock) {
-    char buffer[BUFFER_SIZE];
-    ssize_t n = read(client_fd, buffer, BUFFER_SIZE - 1);
-    if (n <= 0) { close(client_fd); return; }
-    buffer[n] = '\0';
+    struct timeval tv = { .tv_sec = IDLE_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    char key[2048];
-    parse_path(buffer, key, sizeof(key));
+    // ---- keep-alive loop: many requests on this one connection ----
+    int served = 0;
+    while (served < MAX_KEEPALIVE_REQUESTS) {
+        char buffer[BUFFER_SIZE];
 
-    char send_buf[BUFFER_SIZE * 4];   // this thread's private copy to send
-    size_t send_len = 0;
-    int have_response = 0;
+        // Framing simplification: we assume one read() yields exactly one
+        // complete request. True in practice for wrk's small GETs on a LAN,
+        // not in general. The epoll version buffers properly.
+        ssize_t n = read(client_fd, buffer, BUFFER_SIZE - 1);
+        if (n <= 0) {
+            // n == 0 : client closed cleanly.
+            // n <  0 : error, or EAGAIN/EWOULDBLOCK from SO_RCVTIMEO — the
+            //          client went idle. Either way we're done with it.
+            break;
+        }
+        buffer[n] = '\0';
 
-    // --- cache lookup: critical section ---
-    pthread_mutex_lock(lock);
-    char *cached = cache_get(cache, key);
-    if (cached) {
-        // COPY OUT WHILE STILL HOLDING THE LOCK. The moment we unlock, another
-        // thread's cache_set (update branch frees the old value) or an eviction
-        // could free this exact memory — sending from `cached` after unlock is
-        // a use-after-free. So we snapshot it into our private buffer first.
-        send_len = strlen(cached);
-        if (send_len >= sizeof(send_buf)) send_len = sizeof(send_buf) - 1;
-        memcpy(send_buf, cached, send_len);
-        have_response = 1;
-    }
-    pthread_mutex_unlock(lock);
+        int wants_close = client_requested_close(buffer, (size_t)n);
 
-    if (have_response) {
-        //printf("HIT  %s\n", key);
-    } else {
-        // MISS: fetch from the origin WITHOUT holding the lock. A network
-        // round-trip is slow; holding the mutex across it would serialize every
-        // thread on the cache and erase the concurrency we just added.
-        ssize_t olen = fetch_from_origin(key, send_buf, sizeof(send_buf));
-        if (olen > 0) {
-            send_buf[olen] = '\0';     // null-terminate for cache_set's strdup
-            send_len = (size_t)olen;
+        char key[2048];
+        parse_path(buffer, key, sizeof(key));
 
-            // re-acquire the lock only to insert — a short critical section
-            pthread_mutex_lock(lock);
-            cache_set(cache, key, send_buf);
-            pthread_mutex_unlock(lock);
+        char send_buf[BUFFER_SIZE * 4];   // this thread's private copy to send
+        size_t send_len = 0;
+        int have_response = 0;
+        int keep_alive = 0;
 
+        // --- cache lookup: critical section ---
+        pthread_mutex_lock(lock);
+        char *cached = cache_get(cache, key);
+        if (cached) {
+            // COPY OUT WHILE STILL HOLDING THE LOCK. The moment we unlock,
+            // another thread's cache_set (update branch frees the old value) or
+            // an eviction could free this exact memory — sending from `cached`
+            // after unlock is a use-after-free. Snapshot it first.
+            send_len = strlen(cached);
+            if (send_len >= sizeof(send_buf)) send_len = sizeof(send_buf) - 1;
+            memcpy(send_buf, cached, send_len);
+            send_buf[send_len] = '\0';
             have_response = 1;
         }
-        //printf("MISS %s\n", key);
+        pthread_mutex_unlock(lock);
+
+        if (have_response) {
+            // Cached values were normalized before insertion, so this only
+            // re-checks framing — and it runs on our private copy, not on
+            // cache memory, so no lock is needed for it.
+            keep_alive = can_keep_alive(send_buf);
+            //printf("HIT  %s\n", key);
+        } else {
+            // MISS: fetch from the origin WITHOUT holding the lock. A network
+            // round-trip is slow; holding the mutex across it would serialize
+            // every thread on the cache and erase the concurrency we added.
+            ssize_t olen = fetch_from_origin(key, send_buf, sizeof(send_buf));
+            if (olen > 0) {
+                send_buf[olen] = '\0';
+                olen = normalize_response(send_buf, (size_t)olen, sizeof(send_buf));
+            }
+
+            if (olen > 0) {
+                upgrade_to_http11(send_buf);
+                send_len = (size_t)olen;
+
+                // re-acquire the lock only to insert — a short critical section
+                pthread_mutex_lock(lock);
+                cache_set(cache, key, send_buf);   // cache the NORMALIZED form
+                pthread_mutex_unlock(lock);
+
+                have_response = 1;
+                keep_alive = can_keep_alive(send_buf);
+            }
+            //printf("MISS %s\n", key);
+        }
+
+        if (have_response) {
+            if (write_all(client_fd, send_buf, send_len) < 0) break;
+        } else {
+            const char *bad =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 16\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "502 Bad Gateway\n";
+            write_all(client_fd, bad, strlen(bad));
+            break;                      // gateway error — hang up
+        }
+
+        served++;
+        if (!keep_alive || wants_close) break;
+        // no close here: loop back and read the next request
     }
 
-    if (have_response) {
-        write_all(client_fd, send_buf, send_len);
-    } else {
-        const char *bad =
-            "HTTP/1.0 502 Bad Gateway\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 16\r\n"
-            "\r\n"
-            "502 Bad Gateway\n";
-        write_all(client_fd, bad, strlen(bad));
-    }
-
-    close(client_fd);
+    close(client_fd);   // closed once, after the client is done with us
 }
 
 void *client_thread(void *arg) {
     client_ctx *ctx = (client_ctx *)arg;
     handle_client(ctx->client_fd, ctx->cache, ctx->lock);
+
+    // This thread dies here, and its __thread origin socket dies with it —
+    // but only the variable does, not the fd. Without this the descriptor is
+    // orphaned on every connection and the process runs out of fds under load.
+    origin_drop();
+
     free(ctx);        // this thread owns the ctx; free it when done
     return NULL;
 }
 
 int main(void) {
     lru_cache *cache = cache_create(1024, 100);
+    if (!cache) { fprintf(stderr, "failed to create cache\n"); exit(1); }
 
     pthread_mutex_t cache_lock;
     pthread_mutex_init(&cache_lock, NULL);
@@ -355,8 +600,8 @@ int main(void) {
     }
 
     if (listen(server_fd, 128) < 0) { perror("listen"); exit(1); }
-    printf("Threaded proxy listening on port %d, forwarding to %s:%s\n",
-           PORT, ORIGIN_HOST, ORIGIN_PORT);
+    printf("Threaded proxy listening on port %d, forwarding to %s:%s "
+           "(keep-alive: client + origin)\n", PORT, ORIGIN_HOST, ORIGIN_PORT);
 
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
