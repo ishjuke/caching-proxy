@@ -1,6 +1,7 @@
 // ============================================================
-//  server_epoll.c — Phase 4b: single-threaded epoll event loop
-//                   with a NON-BLOCKING origin fetch.
+//  server_epoll.c — single-threaded epoll event loop with a
+//                   NON-BLOCKING origin fetch and client-side
+//                   HTTP keep-alive.
 //
 //  One thread. One loop. Two sockets per cache miss (client +
 //  origin), both registered with the same epoll instance and
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>        // strncasecmp
 #include <stdint.h>
 #include <unistd.h>         // read, write, close
 #include <arpa/inet.h>      // sockaddr_in, htons
@@ -203,7 +205,7 @@ void cache_free(lru_cache *c) {
 #define MAX_EVENTS   64
 
 #define ORIGIN_HOST  "localhost"
-#define ORIGIN_PORT  "9000"
+#define ORIGIN_PORT  "80"
 
 // Per-request logging costs a syscall (and, to a terminal, far more than the
 // request itself). Keep at 0 for benchmarks.
@@ -262,6 +264,15 @@ typedef struct connection {
     size_t len;                  // bytes in buf
     size_t off;                  // bytes already written to the client
 
+    int keep_alive;              // reuse this connection after the response?
+
+    // Bytes the client sent AFTER the request we're currently serving. buf is
+    // about to be overwritten by the response, so they have to live somewhere
+    // else until we flip back to reading. Almost always empty — a client has
+    // to pipeline (or send early) for this to be non-zero.
+    char pend[BUFFER_SIZE];
+    size_t pend_len;
+
     char oreq[2304];             // the GET we send to the origin
     size_t oreq_len;
     size_t oreq_off;             // resumable partial write
@@ -314,7 +325,113 @@ void parse_path(const char *request, char *out, size_t out_size) {
     }
 }
 
-static void on_writable(int epfd, connection *c);
+// ------------------------------------------------------------
+//  Header helpers
+// ------------------------------------------------------------
+
+// Case-insensitive substring search over a bounded region (headers only —
+// never let one of these run into a body, which can contain anything).
+static const char *find_ci(const char *hay, size_t n, const char *needle) {
+    size_t m = strlen(needle);
+    if (m > n) return NULL;
+    for (size_t i = 0; i + m <= n; i++) {
+        if (strncasecmp(hay + i, needle, m) == 0) return hay + i;
+    }
+    return NULL;
+}
+
+// Did the CLIENT ask us to close? HTTP/1.1 defaults to keep-alive; HTTP/1.0
+// defaults the other way.
+static int client_requested_close(const char *req, size_t len) {
+    if (find_ci(req, len, "\r\nconnection: close")) return 1;
+    const char *eol = strstr(req, "\r\n");
+    size_t line = eol ? (size_t)(eol - req) : len;
+    if (find_ci(req, line, "HTTP/1.0") && !find_ci(req, len, "connection: keep-alive")) return 1;
+    return 0;
+}
+
+// Connection (and friends) are HOP-BY-HOP headers: they describe one TCP link,
+// not the end-to-end message. We speak HTTP/1.0 to the origin, so the origin
+// answers "Connection: close" — relay that verbatim and we'd be telling the
+// CLIENT to hang up after every response, and caching it would serve that
+// close directive forever. So: strip them, and state our own.
+static int is_hop_by_hop(const char *line, size_t len) {
+    static const char *names[] = {
+        "connection:", "keep-alive:", "proxy-connection:",
+        "transfer-encoding:", "upgrade:", "te:", "trailer:", NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        size_t n = strlen(names[i]);
+        if (len >= n && strncasecmp(line, names[i], n) == 0) return 1;
+    }
+    return 0;
+}
+
+// Rewrites `resp` in place. Returns the new length, or -1 if unusable.
+static ssize_t normalize_response(char *resp, size_t len, size_t cap) {
+    char *hdr_end = strstr(resp, "\r\n\r\n");
+    if (!hdr_end) return -1;
+
+    size_t header_block = (size_t)(hdr_end - resp) + 2;   // through last header's CRLF
+    size_t body_off     = header_block + 2;
+    size_t body_len     = len - body_off;
+
+    static char tmp[BUFFER_SIZE * 4];   // single-threaded: one scratch buffer is fine
+    size_t w = 0;
+    size_t i = 0;
+    int first = 1;   // the status line is not a header — never drop it
+
+    while (i < header_block) {
+        size_t j = i;
+        while (j + 1 < header_block && !(resp[j] == '\r' && resp[j + 1] == '\n')) j++;
+        size_t line_len = j - i;
+
+        if (first || !is_hop_by_hop(resp + i, line_len)) {
+            if (w + line_len + 2 > sizeof(tmp)) return -1;
+            memcpy(tmp + w, resp + i, line_len);
+            w += line_len;
+            tmp[w++] = '\r';
+            tmp[w++] = '\n';
+        }
+        first = 0;
+        i = j + 2;
+    }
+
+    static const char conn_hdr[] = "Connection: keep-alive\r\n\r\n";
+    if (w + sizeof(conn_hdr) - 1 + body_len > sizeof(tmp)) return -1;
+    memcpy(tmp + w, conn_hdr, sizeof(conn_hdr) - 1);
+    w += sizeof(conn_hdr) - 1;
+
+    memcpy(tmp + w, resp + body_off, body_len);
+    w += body_len;
+
+    if (w > cap) return -1;
+    memcpy(resp, tmp, w);
+    resp[w] = '\0';
+    return (ssize_t)w;
+}
+
+// A connection can only be reused if the client can find the end of the
+// response without waiting for EOF: Content-Length present, no Connection: close.
+static int can_keep_alive(const char *resp) {
+    const char *end = strstr(resp, "\r\n\r\n");
+    if (!end) return 0;
+    size_t hlen = (size_t)(end - resp) + 2;
+
+    if (!find_ci(resp, hlen, "\r\ncontent-length:")) return 0;
+    if (find_ci(resp, hlen, "connection: close"))    return 0;
+    return 1;
+}
+
+// An HTTP/1.0 response with no explicit keep-alive means "closes when done" to
+// every client. One-byte edit, since the version tokens are the same length.
+static void upgrade_to_http11(char *resp) {
+    if (strncmp(resp, "HTTP/1.0", 8) == 0) resp[7] = '1';
+}
+
+// ------------------------------------------------------------
+
+static void on_writable(int epfd, connection *c, lru_cache *cache);
 
 // buf already holds the response (len set). Start sending it.
 static void flip_to_writing(int epfd, connection *c) {
@@ -327,14 +444,15 @@ static void flip_to_writing(int epfd, connection *c) {
 
 // Copy a response into buf, then start sending it.
 static void begin_response(int epfd, connection *c, const char *resp, size_t rlen) {
-    if (rlen > sizeof(c->buf)) rlen = sizeof(c->buf);
+    if (rlen > sizeof(c->buf) - 1) rlen = sizeof(c->buf) - 1;
     memmove(c->buf, resp, rlen);      // memmove: resp may alias c->buf
+    c->buf[rlen] = '\0';
     c->len = rlen;
     flip_to_writing(epfd, c);
 }
 
 static const char RESP_502[] =
-    "HTTP/1.0 502 Bad Gateway\r\n"
+    "HTTP/1.1 502 Bad Gateway\r\n"
     "Content-Type: text/plain\r\n"
     "Content-Length: 16\r\n"
     "Connection: close\r\n"
@@ -342,19 +460,22 @@ static const char RESP_502[] =
     "502 Bad Gateway\n";
 
 static const char RESP_400[] =
-    "HTTP/1.0 400 Bad Request\r\n"
+    "HTTP/1.1 400 Bad Request\r\n"
     "Content-Type: text/plain\r\n"
     "Content-Length: 16\r\n"
     "Connection: close\r\n"
     "\r\n"
     "400 Bad Request\n";
 
-// Abandon the origin and send an error to the client.
+// Abandon the origin and send an error to the client, then hang up.
 // MAY FREE c (via on_writable) — every caller must `return` straight after.
-static void fail_with(int epfd, connection *c, const char *resp, size_t rlen) {
+static void fail_with(int epfd, connection *c, const char *resp, size_t rlen,
+                      lru_cache *cache) {
     origin_close(epfd, c);
+    c->keep_alive = 0;                // these responses say Connection: close
+    c->pend_len = 0;                  // whatever was pipelined is moot now
     begin_response(epfd, c, resp, rlen);
-    on_writable(epfd, c);
+    on_writable(epfd, c, cache);
 }
 
 // ------------------------------------------------------------
@@ -366,13 +487,13 @@ static void fail_with(int epfd, connection *c, const char *resp, size_t rlen) {
 // step 2 has to check SO_ERROR rather than assuming success.
 //
 // MAY FREE c on the failure paths. Caller must return immediately.
-static void start_origin_fetch(int epfd, connection *c) {
+static void start_origin_fetch(int epfd, connection *c, lru_cache *cache) {
     int ofd = socket(AF_INET, SOCK_STREAM, 0);
-    if (ofd < 0) { fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1); return; }
+    if (ofd < 0) { fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache); return; }
 
     if (set_nonblocking(ofd) < 0) {
         close(ofd);
-        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
         return;
     }
 
@@ -381,10 +502,14 @@ static void start_origin_fetch(int epfd, connection *c) {
         // EINTR on a non-blocking connect also means "in progress" — don't
         // retry it, that would return EALREADY.
         close(ofd);
-        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
         return;
     }
 
+    // HTTP/1.0 to the origin, deliberately: the origin then closes when it's
+    // done, and that EOF is what tells ST_ORIGIN_READING the body has ended.
+    // Origin-side keep-alive would need Content-Length framing instead — see
+    // the note at the bottom of this file.
     int n = snprintf(c->oreq, sizeof(c->oreq),
                      "GET %s HTTP/1.0\r\n"
                      "Host: %s\r\n"
@@ -412,6 +537,49 @@ static void start_origin_fetch(int epfd, connection *c) {
 }
 
 // ------------------------------------------------------------
+//  Serve one complete request that is already buffered in c->buf
+// ------------------------------------------------------------
+// Returns 1 if a response is now staged in buf and the connection is in
+// ST_WRITING; 0 if it went async (origin fetch) or was freed.
+static int process_request(int epfd, connection *c, lru_cache *cache) {
+    char *req_end = strstr(c->buf, "\r\n\r\n");
+    size_t req_len = req_end ? (size_t)(req_end - c->buf) + 4 : c->len;
+
+    parse_path(c->buf, c->key, sizeof(c->key));
+    c->keep_alive = !client_requested_close(c->buf, req_len);
+
+    // Stash anything the client already sent past this request — the response
+    // is about to overwrite buf. This is the whole reason `pend` exists.
+    size_t leftover = c->len > req_len ? c->len - req_len : 0;
+    if (leftover > sizeof(c->pend)) {
+        // More pipelined data than we're willing to hold. Serve this request,
+        // then hang up rather than silently dropping the rest.
+        c->keep_alive = 0;
+        leftover = 0;
+    }
+    if (leftover > 0) memcpy(c->pend, c->buf + req_len, leftover);
+    c->pend_len = leftover;
+    c->len = 0;
+
+    char *cached = cache_get(cache, c->key);
+    if (cached) {
+        // Copy out immediately. `cached` points into the cache, and this
+        // connection lives across many loop iterations — another connection's
+        // cache_set (or the eviction it triggers) can free that memory before
+        // we finish writing. Same rule as the mutex versions, different reason.
+        LOGF("HIT  %s\n", c->key);
+        size_t vlen = strlen(cached);
+        if (!can_keep_alive(cached)) c->keep_alive = 0;
+        begin_response(epfd, c, cached, vlen);
+        return 1;
+    }
+
+    LOGF("MISS %s\n", c->key);
+    start_origin_fetch(epfd, c, cache);
+    return 0;   // the client now waits, tracked by state, while others are served
+}
+
+// ------------------------------------------------------------
 //  Client socket READABLE (state ST_READING)
 // ------------------------------------------------------------
 // MAY FREE c. Caller must return immediately.
@@ -427,67 +595,85 @@ static void on_readable(int epfd, connection *c, lru_cache *cache) {
         if (n > 0) {
             c->len += (size_t)n;
         } else if (n == 0) {
-            conn_close(epfd, c);          // client left before finishing
+            conn_close(epfd, c);          // client left between/mid request
             return;
         } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
             conn_close(epfd, c);
             return;
         }
         // EAGAIN: not an error. Fall through — what we already buffered may
-        // well be a complete request line.
+        // well be a complete request.
     }
 
     c->buf[c->len] = '\0';
-    if (!strstr(c->buf, "\r\n")) {
+
+    // A request ends at the header terminator. Under keep-alive we need the
+    // real boundary, not just the end of the request line: without it we
+    // couldn't tell where request N stops and request N+1 begins.
+    if (!strstr(c->buf, "\r\n\r\n")) {
         if (c->len >= sizeof(c->buf) - 1) {
-            fail_with(epfd, c, RESP_400, sizeof(RESP_400) - 1);   // never terminated
+            fail_with(epfd, c, RESP_400, sizeof(RESP_400) - 1, cache);
             return;
         }
         return;                            // partial request — wait for more
     }
 
-    // Parse the path BEFORE anything overwrites buf.
-    parse_path(c->buf, c->key, sizeof(c->key));
-
-    char *cached = cache_get(cache, c->key);
-    if (cached) {
-        // Copy out immediately. `cached` points into the cache, and this
-        // connection lives across many loop iterations — another connection's
-        // cache_set (or the eviction it triggers) can free that memory before
-        // we finish writing. Same rule as the mutex version, different reason.
-        LOGF("HIT  %s\n", c->key);
-        begin_response(epfd, c, cached, strlen(cached));
-        on_writable(epfd, c);              // usually writable already
-        return;
-    }
-
-    LOGF("MISS %s\n", c->key);
-    start_origin_fetch(epfd, c);
-    // NOTE: no on_writable here. The client has nothing to receive yet — it
-    // now waits, tracked entirely by its state, while the loop serves others.
+    if (!process_request(epfd, c, cache)) return;
+    on_writable(epfd, c, cache);           // usually writable already
 }
 
 // ------------------------------------------------------------
 //  Client socket WRITABLE (state ST_WRITING)
 // ------------------------------------------------------------
+// Sends the staged response, then either reuses the connection for the next
+// request or closes it. Loops rather than recursing: a client that pipelines N
+// requests would otherwise nest N frames deep through
+// on_writable -> flip -> process_request -> on_writable.
+//
 // MAY FREE c. Caller must return immediately.
-static void on_writable(int epfd, connection *c) {
-    while (c->off < c->len) {
-        ssize_t n = write(c->fd, c->buf + c->off, c->len - c->off);
+static void on_writable(int epfd, connection *c, lru_cache *cache) {
+    for (;;) {
+        while (c->off < c->len) {
+            ssize_t n = write(c->fd, c->buf + c->off, c->len - c->off);
 
-        if (n > 0) {
-            c->off += (size_t)n;           // partial write: resume from here
-            continue;
+            if (n > 0) {
+                c->off += (size_t)n;       // partial write: resume from here
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;                    // send buffer full; wait for EPOLLOUT
+            }
+            conn_close(epfd, c);           // EPIPE, ECONNRESET, ...
+            return;
         }
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;                        // send buffer full; wait for EPOLLOUT
+
+        // ---- response fully sent ----
+        if (!c->keep_alive) {
+            conn_close(epfd, c);
+            return;
         }
-        conn_close(epfd, c);               // EPIPE, ECONNRESET, ...
+
+        // Reuse the connection: restore whatever the client sent past the
+        // request we just served.
+        c->len = c->pend_len;
+        if (c->pend_len > 0) memcpy(c->buf, c->pend, c->pend_len);
+        c->pend_len = 0;
+        c->off = 0;
+        c->buf[c->len] = '\0';
+        c->state = ST_READING;
+
+        // A complete pipelined request already in hand? Serve it now —
+        // level-triggered epoll will not re-notify us about bytes that are
+        // already off the socket and sitting in our buffer.
+        if (c->len > 0 && strstr(c->buf, "\r\n\r\n")) {
+            if (!process_request(epfd, c, cache)) return;   // async or freed
+            continue;                                       // loop writes the response
+        }
+
+        epoll_mod(epfd, c->fd, EPOLLIN, &c->client_tag);
         return;
     }
-
-    conn_close(epfd, c);                   // fully sent
 }
 
 // ------------------------------------------------------------
@@ -498,16 +684,30 @@ static void origin_finish(int epfd, connection *c, lru_cache *cache) {
     origin_close(epfd, c);
 
     if (c->len == 0) {                     // origin closed without answering
-        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
         return;
     }
 
-    c->buf[c->len] = '\0';                 // cache_set's strdup needs the NUL
-    cache_set(cache, c->key, c->buf);
+    c->buf[c->len] = '\0';
+
+    // Strip the origin's hop-by-hop headers and state our own. Without this we
+    // would relay the origin's "Connection: close" to the client and keep-alive
+    // would never engage — and the cached copy would carry it forever.
+    ssize_t nl = normalize_response(c->buf, c->len, sizeof(c->buf) - 1);
+    if (nl <= 0) {
+        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
+        return;
+    }
+    c->len = (size_t)nl;
+    upgrade_to_http11(c->buf);
+
+    cache_set(cache, c->key, c->buf);      // cache the NORMALIZED form
+
+    if (!can_keep_alive(c->buf)) c->keep_alive = 0;
 
     // buf already holds the response, in place — nothing to copy.
     flip_to_writing(epfd, c);
-    on_writable(epfd, c);
+    on_writable(epfd, c, cache);
 }
 
 // ------------------------------------------------------------
@@ -519,7 +719,7 @@ static void on_origin_event(int epfd, connection *c, uint32_t e, lru_cache *cach
     // ---- step 2: the connect finished (or failed) ----
     if (c->state == ST_ORIGIN_CONNECTING) {
         if (e & EPOLLERR) {
-            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
             return;
         }
 
@@ -530,7 +730,7 @@ static void on_origin_event(int epfd, connection *c, uint32_t e, lru_cache *cach
         socklen_t slen = sizeof(soerr);
         if (getsockopt(c->origin_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) {
             errno = soerr;
-            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
             return;
         }
 
@@ -547,7 +747,7 @@ static void on_origin_event(int epfd, connection *c, uint32_t e, lru_cache *cach
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 return;                    // resume on the next EPOLLOUT
             }
-            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
             return;
         }
 
@@ -572,7 +772,7 @@ static void on_origin_event(int epfd, connection *c, uint32_t e, lru_cache *cach
                 // body — a poisoned entry would serve the truncation to every
                 // later hit.
                 LOGF("TRUNC %s\n", c->key);
-                fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+                fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
                 return;
             }
 
@@ -586,14 +786,14 @@ static void on_origin_event(int epfd, connection *c, uint32_t e, lru_cache *cach
                 // not EAGAIN, so this really does mean "wait".
                 return;
             }
-            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);      // ECONNRESET, ...
+            fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache); // ECONNRESET, ...
             return;
         }
     }
 
     // Any other state means an event on a socket we thought was idle.
     if (e & (EPOLLHUP | EPOLLERR)) {
-        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1);
+        fail_with(epfd, c, RESP_502, sizeof(RESP_502) - 1, cache);
     }
 }
 
@@ -611,7 +811,7 @@ static void on_client_event(int epfd, connection *c, uint32_t e, lru_cache *cach
     if ((e & EPOLLIN) && c->state == ST_READING) {
         on_readable(epfd, c, cache);
     } else if ((e & EPOLLOUT) && c->state == ST_WRITING) {
-        on_writable(epfd, c);
+        on_writable(epfd, c, cache);
     }
 }
 
@@ -661,7 +861,7 @@ int main(void) {
 
     epoll_add(epfd, listen_fd, EPOLLIN, NULL);   // NULL = "this is the listener"
 
-    printf("epoll proxy on port %d -> %s:%s (phase 4b: async origin fetch)\n",
+    printf("epoll proxy on port %d -> %s:%s (async origin fetch, client keep-alive)\n",
            PORT, ORIGIN_HOST, ORIGIN_PORT);
     fflush(stdout);
 
@@ -721,3 +921,22 @@ int main(void) {
     cache_free(cache);
     return 0;
 }
+
+// ============================================================
+//  Known gaps (deliberate, not oversights)
+//
+//  1. No timeouts. A client that connects and never sends, or one that goes
+//     idle on a kept-alive connection, holds its connection object forever.
+//     SO_RCVTIMEO does not apply here — nothing blocks. The fix is a deadline
+//     per connection plus a finite epoll_wait timeout and a periodic sweep.
+//     This matters MORE now than before keep-alive: idle connections are the
+//     normal state of a kept-alive server.
+//
+//  2. No origin-side keep-alive. Every miss opens a fresh origin connection,
+//     unlike server.c / server_threaded.c / server_pool.c, which now pool
+//     theirs. Adding it here means replacing the read-until-EOF in
+//     ST_ORIGIN_READING with Content-Length framing, keeping a free list of
+//     idle origin sockets, and handling the case where a pooled socket turns
+//     out to be dead by restarting the fetch. Until then, MISS numbers are not
+//     comparable across versions; HIT numbers are.
+// ============================================================
